@@ -5,6 +5,7 @@ Tests for the sklearn-compatible GES class in pgmpy.causal_discovery.
 import numpy as np
 import pandas as pd
 import pytest
+from skbase.utils.dependencies import _check_soft_dependencies
 from sklearn.utils.estimator_checks import parametrize_with_checks
 
 from pgmpy.base import PDAG
@@ -52,6 +53,14 @@ def titanic_data_mixed(titanic_data):
 @pytest.fixture
 def titanic_data_categorical(titanic_data):
     return titanic_data[["Survived", "Sex", "Pclass"]].astype("category")
+
+
+def test_ges_turn_phase_deterministic(rand_data):
+    # The turning phase sorts its candidate edges, so GES returns a stable CPDAG that does not depend
+    # on internal edge insertion order; two fits on identical data must give identical edges.
+    g1 = GES(scoring_method=K2(rand_data), return_type="pdag").fit(rand_data).causal_graph_
+    g2 = GES(scoring_method=K2(rand_data), return_type="pdag").fit(rand_data).causal_graph_
+    assert set(g1.get_edges(data=True)) == set(g2.get_edges(data=True))
 
 
 # Optional manual parity check against `causal-learn==0.1.4.5`.
@@ -127,19 +136,19 @@ def titanic_data_categorical(titanic_data):
 def test_insert_orients_t_away_from_v():
     est = GES()
 
-    pdag = PDAG(undirected_ebunch=[("B", "C")])
+    pdag = PDAG([("B", "C", "--")])
     pdag.add_nodes_from(["A", "B", "C"])
 
     new_model = est.insert("A", "B", {"C"}, pdag)
 
-    assert new_model.directed_edges == {("A", "B"), ("B", "C")}
+    assert new_model.directed_edges == {("A", "B"), ("C", "B")}
     assert new_model.undirected_edges == set()
 
 
 def test_legal_edge_deletions_include_both_orders_for_undirected_edges():
     est = GES()
 
-    pdag = PDAG(undirected_ebunch=[("A", "B")])
+    pdag = PDAG([("A", "B", "--")])
     pdag.add_nodes_from(["A", "B"])
 
     assert set(est._legal_edge_deletions(pdag)) == {("A", "B"), ("B", "A")}
@@ -189,6 +198,85 @@ class TestGESCore:
         est.fit(rand_data)
         assert hasattr(est, "n_features_in_")
         assert hasattr(est, "feature_names_in_")
+
+
+@pytest.mark.skipif(
+    not _check_soft_dependencies("sempler", severity="none"),
+    reason="execute only if required dependency present",
+)
+class TestParityGES:
+    """Tests for checking if results match the ges package (ref PR #3304 for details).
+    Code to reproduce:
+
+        import sempler
+        import sempler.generators
+        import numpy as np
+        import pandas as pd
+        import ges
+        import networkx as nx
+
+        from pgmpy.estimators import GES
+
+
+        NUM_GRAPHS = 1
+        p = 9  # number of variables
+        n = 1000  # size of the observational sample
+
+        np.random.seed(0)
+
+        A = sempler.generators.dag_avg_deg(p, 3, 1, 1, random_state=10)
+        W = A * np.random.uniform(1, 2, A.shape)
+        obs_sample = sempler.LGANM(W, (1, 10), (0.5, 1), random_state=10).sample(n=n, random_state=10)
+
+        data = pd.DataFrame(obs_sample)
+        cols = [f"X{i}" for i in data.columns]
+        data.columns = cols
+
+        output_juan = ges.fit_bic(obs_sample, phases=["forward", "backward", "turning"], debug=2)
+
+        output_pgmpy = GES(data).estimate(scoring_method='bic-g', debug=True)
+        output_pgmpy_adj = nx.to_numpy_array(output_pgmpy, nodelist=cols)
+
+        print("Edge differences - ")
+        print(output_juan[0]-output_pgmpy_adj)
+    """
+
+    def test_parity(self):
+        import sempler
+        import sempler.generators
+
+        rng = np.random.default_rng(42)
+        A = sempler.generators.dag_avg_deg(9, 3, 1, 1, random_state=10)
+        W = A * rng.uniform(1, 2, A.shape)
+        obs_sample = sempler.LGANM(W, (1, 10), (0.5, 1), random_state=10).sample(n=1000, random_state=10)
+
+        data = pd.DataFrame(obs_sample, columns=[f"X{i}" for i in range(9)])
+        est = GES(scoring_method="bic-g").fit(data)
+        assert sorted(est.causal_graph_.nodes()) == ["X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8"]
+        assert sorted(est.causal_graph_.undirected_edges) == [("X0", "X6"), ("X1", "X3"), ("X2", "X7"), ("X3", "X6")]
+        assert sorted(est.causal_graph_.directed_edges) == [
+            ("X1", "X2"),
+            ("X1", "X4"),
+            ("X1", "X5"),
+            ("X1", "X7"),
+            ("X1", "X8"),
+            ("X2", "X8"),
+            ("X3", "X2"),
+            ("X3", "X4"),
+            ("X3", "X7"),
+            ("X3", "X8"),
+            ("X4", "X2"),
+            ("X4", "X5"),
+            ("X4", "X7"),
+            ("X4", "X8"),
+            ("X5", "X2"),
+            ("X5", "X7"),
+            ("X5", "X8"),
+            ("X6", "X2"),
+            ("X6", "X4"),
+            ("X6", "X7"),
+            ("X7", "X8"),
+        ]
 
 
 def test_expert_knowledge_not_supported():
